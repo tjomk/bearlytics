@@ -74,7 +74,7 @@
 </div>
 {% endif %}
 
-<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
     <div class="bg-white dark:bg-gray-900 p-6 rounded-lg shadow-md">
         <h2 class="text-sm text-gray-600 dark:text-gray-200 mb-2">Views</h2>
         <p class="text-2xl font-semibold text-gray-800 dark:text-gray-200">{{ stats.views }}</p>
@@ -86,6 +86,10 @@
     <div class="bg-white dark:bg-gray-900 p-6 rounded-lg shadow-md">
         <h2 class="text-sm text-gray-600 dark:text-gray-200 dark: mb-2">Visitors</h2>
         <p class="text-2xl font-semibold text-gray-800 dark:text-gray-200">{{ stats.visitors }}</p>
+    </div>
+    <div class="bg-white dark:bg-gray-900 p-6 rounded-lg shadow-md">
+        <h2 class="text-sm text-gray-600 dark:text-gray-200 mb-2">Events</h2>
+        <p class="text-2xl font-semibold text-gray-800 dark:text-gray-200">{{ stats.events }}</p>
     </div>
 </div>
 
@@ -128,6 +132,23 @@
                         {{ ref.referrer }}
                     </a>
                     <span class="text-gray-800 dark:text-gray-200">{{ ref.visits }}</span>
+                </li>
+                {% endfor %}
+            </div>
+        </ul>
+    </div>
+
+    <div class="bg-white dark:bg-gray-900 p-6 rounded-lg shadow-md">
+        <ul class="divide-y divide-gray-100">
+            <li class="flex justify-between items-center py-2 sticky top-0 bg-white dark:bg-slate-900">
+                <span class="text-gray-600 dark:text-gray-200">Events</span>
+                <span class="text-gray-600 dark:text-gray-200">Clicks</span>
+            </li>
+            <div class="h-[300px] overflow-y-auto">
+                {% for ev in top_events %}
+                <li class="flex justify-between items-center py-2">
+                    <span class="text-gray-600 dark:text-gray-400" title="{{ ev.name }}">{{ ev.name }}</span>
+                    <span class="text-gray-800 dark:text-gray-200">{{ ev.clicks }}</span>
                 </li>
                 {% endfor %}
             </div>
@@ -196,10 +217,12 @@ function utcToLocal(utcStr) {
 const timeLabels = {{ time_labels|safe }};
 const viewsData = {{ views_data|safe }};
 const visitsData = {{ visits_data|safe }};
+const eventsData = {{ events_data|safe }};
 
 console.log('Time Labels:', timeLabels);
 console.log('Views Data:', viewsData);
 console.log('Visits Data:', visitsData);
+console.log('Events Data:', eventsData);
 
 const ctx = document.getElementById('viewsChart').getContext('2d');
 const urlParams = new URLSearchParams(window.location.search);
@@ -215,7 +238,8 @@ for (let i = 0; i < timeLabels.length; i++) {
     parsedData.push({
         x: date,
         views: viewsData[i],
-        visits: visitsData[i]
+        visits: visitsData[i],
+        events: eventsData[i]
     });
 }
 
@@ -260,6 +284,13 @@ new Chart(ctx, {
                 data: parsedData.map(d => ({ x: d.x, y: d.views })),
                 backgroundColor: '#adccf8',
                 borderColor: '#3787ec',
+                borderWidth: 1
+            },
+            {
+                label: 'Events',
+                data: parsedData.map(d => ({ x: d.x, y: d.events })),
+                backgroundColor: '#f5a623',
+                borderColor: '#f5a623',
                 borderWidth: 1
             }
         ]

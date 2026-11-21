@@ -3,6 +3,7 @@ import random
 import string
 import hashlib
 import base64
+from dataclasses import dataclass
 from datetime import timedelta
 import user_agents
 import geoip2
@@ -19,7 +20,7 @@ from django.contrib.auth import authenticate, login
 from django.contrib.gis.geoip2 import GeoIP2
 from django.contrib.auth.models import User
 
-from .models import PageView, Website
+from .models import PageView, Event, Website
 
 
 PIXEL = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
@@ -27,34 +28,34 @@ PIXEL = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQV
 SALT_SECRET = os.getenv("SALT_SECRET")
 
 
-def hit(request, website_id):
-    website = get_object_or_404(Website, id=website_id)
+@dataclass(frozen=True)
+class VisitorContext:
+    """The privacy-preserving visitor identity shared by hit() and event().
 
-    if request.method == "OPTIONS":
-        response = HttpResponse()
-        response["Access-Control-Allow-Origin"] = "*"
-        response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response["Access-Control-Allow-Headers"] = "Content-Type"
-        return response
-    
-    # Set response headers
-    response = HttpResponse(PIXEL, content_type='image/png')
-    response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response['Pragma'] = 'no-cache'
-    response['Expires'] = '0'
-    response["Access-Control-Allow-Origin"] = "*"
-    response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    Invariant: hash_id = sha256(f"{ip}|{ua}|{date}|{SALT_SECRET}") - per-day,
+    no cookies, no PII. Construct only via visitor_context().
+    """
+    hash_id: str
+    device: str
+    browser: str
+    country: str
+    language: str
 
-    # Parse User-Agent
+
+def visitor_context(request) -> "VisitorContext | None":
+    """Derive the visitor context from the request.
+
+    Returns None for bots - callers must return the pixel without recording:
+    whatever a bot does (pageview, click, download), nothing is stored.
+    """
     ua_string = request.META.get('HTTP_USER_AGENT', '')
     user_agent = user_agents.parse(ua_string)
-    
-    # Skip bots
-    if (user_agent.is_bot or 
-        any(bot_keyword in ua_string.lower() 
+
+    if (user_agent.is_bot or
+        any(bot_keyword in ua_string.lower()
             for bot_keyword in ['bot', 'crawler', 'spider', 'headless', 'puppet'])):
-        return response
-        
+        return None
+
     browser = user_agent.browser.family
     browser = browser.replace("Mobile", "").replace("iOS", "").replace("WebView", "").replace("UI/WK", "").strip()
     device = "Mobile" if user_agent.is_mobile else "Desktop"
@@ -73,28 +74,108 @@ def hit(request, website_id):
     data = f"{ip}|{ua_string}|{date}|{SALT_SECRET}"
     hash_id = hashlib.sha256(data.encode()).hexdigest()
 
-    # Get path, and ref from query parameter
-    path = request.GET.get('path', '/')
-    if not path.startswith('/'):
-        path = '/' + path
-
-    referrer = request.GET.get('ref', 'direct')
-    if referrer == "":
-        referrer = "direct"
-    referrer = referrer.replace('http://', '').replace('https://', '').replace('www.', '').split('/')[0]
-
     # Extract basic language code
     language = extract_basic_language(request.META.get('HTTP_ACCEPT_LANGUAGE', ''))
 
-    PageView.objects.create(
-        website=website,
+    return VisitorContext(
         hash_id=hash_id,
-        path=path,
-        referrer=referrer,
         device=device,
         browser=browser,
         country=country,
-        language=language
+        language=language,
+    )
+
+
+def pixel_response() -> HttpResponse:
+    """The fire-and-forget tracking response: a 1x1 PNG any origin can fetch."""
+    response = HttpResponse(PIXEL, content_type='image/png')
+    response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response['Pragma'] = 'no-cache'
+    response['Expires'] = '0'
+    response["Access-Control-Allow-Origin"] = "*"
+    response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+
+
+def options_response() -> HttpResponse:
+    """CORS preflight for the tracking endpoints."""
+    response = HttpResponse()
+    response["Access-Control-Allow-Origin"] = "*"
+    response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
+def normalize_path(raw: str) -> str:
+    path = raw or '/'
+    if not path.startswith('/'):
+        path = '/' + path
+    return path[:2048]
+
+
+def normalize_referrer(raw: str) -> str:
+    referrer = raw if raw else 'direct'
+    return referrer.replace('http://', '').replace('https://', '').replace('www.', '').split('/')[0][:2048]
+
+
+def hit(request, website_id):
+    """Record a pageview. Pixel contract: public GET, CORS *, bots dropped."""
+    website = get_object_or_404(Website, id=website_id)
+
+    if request.method == "OPTIONS":
+        return options_response()
+
+    response = pixel_response()
+
+    ctx = visitor_context(request)
+    if ctx is None:
+        return response
+
+    PageView.objects.create(
+        website=website,
+        hash_id=ctx.hash_id,
+        path=normalize_path(request.GET.get('path', '/')),
+        referrer=normalize_referrer(request.GET.get('ref', '')),
+        device=ctx.device,
+        browser=ctx.browser,
+        country=ctx.country,
+        language=ctx.language
+    )
+
+    return response
+
+
+def event(request, website_id):
+    """Record a click/navigation event. Same pixel contract as hit(): public
+    GET, CORS *, bots dropped. `name` is the only client-supplied semantic -
+    sanitized at the boundary; empty after sanitize means 200 pixel, no row,
+    the same silent-drop stance as bots.
+    """
+    website = get_object_or_404(Website, id=website_id)
+
+    if request.method == "OPTIONS":
+        return options_response()
+
+    response = pixel_response()
+
+    ctx = visitor_context(request)
+    if ctx is None:
+        return response
+
+    name = (request.GET.get('name', '') or '').strip()[:255]
+    if not name:
+        return response
+
+    Event.objects.create(
+        website=website,
+        hash_id=ctx.hash_id,
+        name=name,
+        path=normalize_path(request.GET.get('path', '/')),
+        referrer=normalize_referrer(request.GET.get('ref', '')),
+        device=ctx.device,
+        browser=ctx.browser,
+        country=ctx.country,
+        language=ctx.language
     )
 
     return response
@@ -225,6 +306,40 @@ def dashboard(request, website_id):
             'unique_browsers': row[4],
             'unique_countries': row[5]
         }
+
+    # Events totals — the events table mirrors pageviews' filterable column
+    # names (website_id, timestamp, path, referrer), so the same WHERE clause
+    # and params run against it unchanged.
+    events_stats_sql = f"""
+        SELECT
+            COUNT(*) as events,
+            COUNT(DISTINCT hash_id) as event_visitors
+        FROM events
+        WHERE {where_clause}
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(events_stats_sql, params)
+        row = cursor.fetchone()
+        stats['events'] = row[0]
+        stats['event_visitors'] = row[1]
+
+    top_events_sql = f"""
+        SELECT
+            name,
+            COUNT(*) as clicks,
+            COUNT(DISTINCT hash_id) as visitors
+        FROM events
+        WHERE {where_clause}
+        GROUP BY name
+        ORDER BY clicks DESC
+        LIMIT 100
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(top_events_sql, params)
+        top_events = [
+            dict(zip([col[0] for col in cursor.description], row))
+            for row in cursor.fetchall()
+        ]
     
     # Determine time grouping based on duration
     duration = end_time - start_time
@@ -300,11 +415,24 @@ def dashboard(request, website_id):
             dict(zip(columns, row))
             for row in cursor.fetchall()
         ]
+
+    # Events time series — same period buckets as pageviews (period_format is
+    # derived once), merged into the chart labels at the read boundary.
+    events_series_sql = f"""
+        SELECT strftime('{period_format}', timestamp) as period, COUNT(*) as event_count
+        FROM events
+        WHERE {where_clause}
+        GROUP BY period
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(events_series_sql, params)
+        events_series = cursor.fetchall()
     
     # Format time series data for the template
     time_labels = []
     views_data = []
     visits_data = []
+    events_data = []
     
     # Create time slots and initialize with zeros
     current = start_time
@@ -317,6 +445,7 @@ def dashboard(request, website_id):
         time_labels.append(current.strftime(date_format))
         views_data.append(0)
         visits_data.append(0)
+        events_data.append(0)
         if duration <= timedelta(hours=24):
             current += timedelta(hours=1)
         else:
@@ -331,6 +460,7 @@ def dashboard(request, website_id):
     # Fill in actual data
     # Period from raw SQL is already a formatted string
     time_data_map = {}
+    event_data_map = {}
     for ts in time_series:
         # Convert SQLite datetime string to Python datetime for formatting
         period_str = ts['period']
@@ -342,12 +472,23 @@ def dashboard(request, website_id):
             time_data_map[formatted_period] = (ts['views'], ts['visits'])
         except (ValueError, KeyError, TypeError) as e:
             continue
-    
+
+    for period_str, event_count in events_series:
+        if not period_str:
+            continue
+        try:
+            dt = timezone.datetime.strptime(period_str, '%Y-%m-%d %H:%M:%S')
+            event_data_map[dt.strftime(date_format)] = event_count
+        except (ValueError, TypeError):
+            continue
+
     for i, label in enumerate(time_labels):
         if label in time_data_map:
             views_data[i] = time_data_map[label][0]
             visits_data[i] = time_data_map[label][1]
             total_time_series_visits += time_data_map[label][1]
+        if label in event_data_map:
+            events_data[i] = event_data_map[label]
     
     context = {
         'website': website,
@@ -355,7 +496,9 @@ def dashboard(request, website_id):
         'time_labels': time_labels[1:],
         'views_data': views_data[1:],
         'visits_data': visits_data[1:],
+        'events_data': events_data[1:],
         'top_pages': get_top_metrics('path'),
+        'top_events': top_events,
         'top_referrers': get_top_metrics('referrer'),
         'top_countries': get_top_metrics('country'),
         'top_devices': get_top_metrics('device'),
